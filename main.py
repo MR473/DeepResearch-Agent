@@ -1,97 +1,122 @@
-"""
-ROUGH SKETCH OF A DEEP RESEARCH AGENT
-PARTS:
-- Multi agent environemt
-    - Agents:
-        > Planner: Breaks down the question into sub-questions
-        > Researcher: Use tool to search internet for information. 
-        > Synthesizer: Formulate a detailed proper output for the user. 
-        > Critic: Look into everything along with reference. Cross check everything. Identify missing parts (re-research if necessary)
-"""
-
-# Import libraries
 import os
-from dotenv import load_dotenv
-from deepagents import create_deep_agent
-from tavily import TavilyClient
-from langchain_core.tools import tool 
-from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage
-
 import json
-from pathlib import Path
+import time
+from datetime import datetime
+from typing import Literal
 
+from dotenv import load_dotenv
+from tavily import TavilyClient
+from langchain.chat_models import init_chat_model
+from deepagents import create_deep_agent
 
-# load environemt variables (API keys)
 load_dotenv()
-tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
+ARTIFACT_DIR = "artifacts"
+NOTES_PATH = os.path.join(ARTIFACT_DIR, "notes.md")
+OPEN_Q_PATH = os.path.join(ARTIFACT_DIR, "open_questions.md")
+TOOL_LOG_PATH = os.path.join(ARTIFACT_DIR, "tool_log.jsonl")
+
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+
+def internet_search(
+    query: str,
+    max_results: int = 5,
+    topic: Literal["general", "news", "finance"] = "general",
+    include_raw_content: bool = False,
+):
+    """
+    Search the internet using Tavily.
+
+    Returns results containing titles, URLs, and snippets (and optionally raw content).
+    """
+    ts = datetime.now().isoformat(timespec="seconds")
+    print(f"[TOOL internet_search START {ts}] query={query!r} max_results={max_results} topic={topic}")
+
+    t0 = time.time()
+    result = tavily_client.search(
+        query,
+        max_results=max_results,
+        topic=topic,
+        include_raw_content=include_raw_content,
+    )
+    dt = time.time() - t0
+
+    n = len(result.get("results", [])) if isinstance(result, dict) else 0
+    print(f"[TOOL internet_search END] took={dt:.2f}s results={n}")
+
+    with open(TOOL_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "tool": "internet_search",
+                    "ts": ts,
+                    "query": query,
+                    "max_results": max_results,
+                    "topic": topic,
+                    "include_raw_content": include_raw_content,
+                    "took_sec": round(dt, 3),
+                    "n_results": n,
+                }
+            )
+            + "\n"
+        )
+
+    return result
 
 
-# retrieve schema from file
-def load_schema(path: str) -> str:
-    return json.dumps(json.loads(Path(path).read_text()), indent=2)
+model = init_chat_model(model="gpt-5")
 
-PLANNER_SCHEMA = load_schema("schemas/planner.json")
-RESEARCHER_SCHEMA = load_schema("schemas/researcher.json")
-CRITIC_SCHEMA = load_schema("schemas/critic.json")
+SYSTEM_PROMPT = f"""\
+You are a general-purpose Deep Research Agent.
 
+You must use the filesystem as a NOTEPAD and keep it updated during work:
+- Notes file: {NOTES_PATH}
+- Open questions file: {OPEN_Q_PATH}
+- Save an Append details in these files 
 
-# Tools
-@tool
-def internet_search(query: str, max_results: int = 5):
-    """Run a web search"""
-    return tavily_client.search(query, max_results=max_results)
+Process (repeat only as needed):
+1) Plan approach.
+2) Research using internet_search whenever facts/events/schedules are needed.
+3) Write/update notes in {NOTES_PATH} (bullets + URLs).
+4) Write/update uncertainties/TODOs in {OPEN_Q_PATH}.
+5) Draft the final answer.
+6) Critique the draft briefly:
+   - missing evidence/URLs?
+   - missing logistics/timings?
+   - contradictions?
+7) If there are major gaps, do ONE more research+revision pass, then finalize.
 
-# Set LLM Model
-model = init_chat_model("openai:gpt-5")
-
-# Agent prompts
-planner_prompt = """ 
-You are a Planner Agent. 
-Purpose: Identify possible questions that need to be answered to provide a comprehensive response to the user's query.
-Your duty: 
-    - Give a JSON ouptut ONLY.
-    - is to break down the question into sub-questions that relate to the query.
-    - Each sub-question should be relevant to the main query.
-    - The sub-questions should be specific and focused.
-    - generate a list of 15 search queries that can be done to gather information to answer the sub-questions and query.
-    - Use the schema provided below to structure your response.
-
-    STRICT JSON Schema to follow: {PLANNER_SCHEMA}
+Hard requirements:
+- If the task involves events, schedules, “this year”, holidays, or New Year’s, you MUST call internet_search at least once.
+- Major factual claims in the final answer must include at least one URL (put the URL right next to the claim).
+- Before producing the final answer you MUST ensure:
+  - {NOTES_PATH} exists and contains at least 5 bullets (or says "No external research needed.")
+  - {OPEN_Q_PATH} exists and contains "None" if there are no open questions.
+- Stop once the checklist is satisfied and you have a complete answer; do not keep refining forever.
 """
-researcher_prompt = """ """
-critic_prompt = """ """
-synthesizer_prompt = """ """
 
-# Create Agents
-
-planner_agent = create_deep_agent(
+agent = create_deep_agent(
     model=model,
-    system_prompt=planner_prompt,
+    tools=[internet_search],
+    system_prompt=SYSTEM_PROMPT,
 )
 
-research_agent = create_deep_agent(
-    model=model,
-    system_prompt=researcher_prompt,
-)
+if __name__ == "__main__":
+    user_query = input("Your Question >>> ").strip()
+    if not user_query:
+        raise SystemExit("Please enter a question.")
 
-critic_agent = create_deep_agent(
-    model=model,
-    system_prompt=critic_prompt,
-)
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": user_query}]},
+        config={"recursion_limit": 80},
+    )
 
-synthesizer_agent = create_deep_agent(
-    model=model,
-    system_prompt=synthesizer_prompt,
-)
+    print("\n=== FINAL ANSWER ===\n")
+    print(result["messages"][-1].content)
 
-
-user_query = input("Your Question >>>  ")
-
-
-planner_output = planner_agent.invoke({
-        "messages": [{"role": "user", "content": "Help me research about recent AI developments."}],
-    })
-
-print("OUTPUT:\n")
-print(result["messages"][-1].content)
+    print("\n=== ARTIFACTS SAVED ===")
+    print(f"- {NOTES_PATH}")
+    print(f"- {OPEN_Q_PATH}")
+    print(f"- {TOOL_LOG_PATH}")
