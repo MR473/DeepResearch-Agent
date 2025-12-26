@@ -18,7 +18,9 @@ os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
 NOTES_PATH = "/artifacts/notes.md"
 OPEN_Q_PATH = "/artifacts/open_questions.md"
+OUTPUT_DISK_PATH = os.path.join(ARTIFACT_DIR, "output.txt")
 TOOL_LOG_PATH = os.path.join(ARTIFACT_DIR, "tool_log.jsonl")
+CRITIC_LOG_PATH = os.path.join(ARTIFACT_DIR, "critic_thoughts.txt")
 
 tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
@@ -29,12 +31,9 @@ def internet_search(
     topic: Literal["general", "news", "finance"] = "general",
     include_raw_content: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Search the internet using Tavily.
-    Returns results containing titles, URLs, and snippets (and optionally raw content).
-    """
+    """Search the internet using Tavily and return results with URLs/snippets."""
     ts = datetime.now().isoformat(timespec="seconds")
-    print(f"[TOOL internet_search START {ts}] query={query!r} max_results={max_results} topic={topic}")
+    print(f"[TOOL internet_search START {ts}] query={query!r}")
 
     t0 = time.time()
     result = tavily_client.search(
@@ -55,9 +54,6 @@ def internet_search(
                     "tool": "internet_search",
                     "ts": ts,
                     "query": query,
-                    "max_results": max_results,
-                    "topic": topic,
-                    "include_raw_content": include_raw_content,
                     "took_sec": round(dt, 3),
                     "n_results": n,
                 }
@@ -72,72 +68,139 @@ class ToolCallLogger(BaseCallbackHandler):
     def on_tool_start(self, serialized, input_str, **kwargs):
         name = serialized.get("name", "unknown_tool")
         s = input_str if isinstance(input_str, str) else str(input_str)
-        print(f"[TOOL START] {name} input={s[:500]}")
+        print(f"[TOOL START] {name} input={s[:300]}")
 
     def on_tool_end(self, output, **kwargs):
         preview = str(output)
-        if len(preview) > 500:
-            preview = preview[:500] + "..."
+        if len(preview) > 300:
+            preview = preview[:300] + "..."
         print(f"[TOOL END] output={preview}")
+
+
+def append_critic_thoughts(text: str, round_num: int):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(CRITIC_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"\n=== CRITIC ROUND {round_num} | {ts} ===\n")
+        f.write(text.strip() + "\n")
 
 
 logger = ToolCallLogger()
 model = init_chat_model(model="gpt-5")
 backend = FilesystemBackend(root_dir=ARTIFACT_DIR, virtual_mode=True)
 
-SYSTEM_PROMPT = f"""\
-You are a general-purpose Deep Research Agent.
+system_prompt = f"""\
+You are a Deep Research Agent.
 
-You must use the filesystem tools to maintain a NOTEPAD on disk:
+You must maintain append-only research history:
 - Notes: {NOTES_PATH}
 - Open questions: {OPEN_Q_PATH}
 
 Rules:
-- For any information needed ask by calling the internet_search tool. Avoid pretrained knowledge.
-- If the task involves events/schedules/“this year”/holidays/New Year’s, you MUST call internet_search at least once.
-- During work, frequently write/update {NOTES_PATH} with bullet notes + URLs (one bullet per claim).
-- Track uncertainties/TODOs in {OPEN_Q_PATH}.
-- BEFORE producing your final answer, you MUST ensure:
-  - {NOTES_PATH} exists and has at least 5 bullets (or says "No external research needed.")
-  - {OPEN_Q_PATH} exists and contains "None" if there are no open questions.
-- Do at most ONE critique+revision cycle after drafting, then finalize.
-- Points added after critic and revision need to be mentioned in the .md files with a ["Added after critique" tag].
-- Note down number of critics and revisions that were done before finalizing. Note it down at the end of {NOTES_PATH}.
+- Never overwrite these files after creation.
+- Always read first, then append timestamped sections.
+- Corrections must be appended, not deleted.
+- Resolved questions must be marked with "Resolved:" lines.
+- Use internet_search for factual or time-sensitive info or any information you need.
+- At least one search required.
+- After critic feedback, additions must include [Added after critique].
+- At the end of notes, record:
+  Critique rounds: <N>, Revision rounds: <M>
 
-Major factual claims in the final answer must include at least one URL next to the claim.
+Final answers must cite URLs for factual claims.
 """
 
 critic_prompt = f"""\
-You are a critic for a Deep Research Agent. Your job is to review the agent's work and provide feedback.
-Rules:
-- Check {NOTES_PATH} for completeness and accuracy.
-- Check {OPEN_Q_PATH} for any unresolved questions.
-- Identify any missing information or errors.
-- Provide constructive feedback and suggest specific improvements.
-CRITIC INSTRUCTIONS:
-- If everything is perfect, respond with "No issues found."
-- Otherwise, list the issues found and suggest improvements.
-- 
+You are a critic agent.
+
+Review:
+- {NOTES_PATH}
+- {OPEN_Q_PATH}
+- /artifacts/output.txt
+
+Decide sufficiency.
+
+Output exactly:
+- ENOUGH
+or
+- REVISE:
+  - <specific fix>
+  - <specific fix>
 """
 
 agent = create_deep_agent(
     model=model,
     tools=[internet_search],
-    system_prompt=SYSTEM_PROMPT,
+    system_prompt=system_prompt,
     backend=backend,
 )
+
+critic = create_deep_agent(
+    model=model,
+    system_prompt=critic_prompt,
+    backend=backend,
+)
+
+
+def write_output(text: str):
+    with open(OUTPUT_DISK_PATH, "w", encoding="utf-8") as f:
+        f.write(text)
+
 
 if __name__ == "__main__":
     user_query = input("Your Question >>> ").strip()
     if not user_query:
         raise SystemExit("Please enter a question.")
 
+    MAX_REVISIONS = 3
+    critique_rounds = 0
+    revision_rounds = 0
+
     result = agent.invoke(
         {"messages": [{"role": "user", "content": user_query}]},
         config={"recursion_limit": 150, "callbacks": [logger]},
     )
 
-    print(result["messages"][-1].content)
+    current_text = result["messages"][-1].content
+    print(current_text)
+    write_output(current_text)
+
+    while revision_rounds < MAX_REVISIONS:
+        critique_rounds += 1
+
+        critic_result = critic.invoke(
+            {"messages": [{"role": "user", "content": "Review artifacts now."}]},
+            config={"recursion_limit": 60, "callbacks": [logger]},
+        )
+
+        decision = critic_result["messages"][-1].content.strip()
+        append_critic_thoughts(decision, critique_rounds)
+        print("\nCRITIC DECISION:\n", decision)
+
+        if decision.upper().startswith("ENOUGH"):
+            break
+
+        if not decision.upper().startswith("REVISE"):
+            break
+
+        revision_rounds += 1
+
+        feedback = (
+            decision
+            + f"\nCritique rounds={critique_rounds}, Revision rounds={revision_rounds}."
+        )
+
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": user_query + "\n\nCRITIC FEEDBACK:\n" + feedback}]},
+            config={"recursion_limit": 150, "callbacks": [logger]},
+        )
+
+        current_text = result["messages"][-1].content
+        print("\nREVISED OUTPUT:\n")
+        print(current_text)
+        write_output(current_text)
+
+    print(OUTPUT_DISK_PATH)
     print(os.path.join(ARTIFACT_DIR, "notes.md"))
     print(os.path.join(ARTIFACT_DIR, "open_questions.md"))
     print(TOOL_LOG_PATH)
+    print(CRITIC_LOG_PATH)
