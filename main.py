@@ -31,7 +31,9 @@ def internet_search(
     topic: Literal["general", "news", "finance"] = "general",
     include_raw_content: bool = False,
 ) -> Dict[str, Any]:
+    
     """Search the internet using Tavily and return results with URLs/snippets."""
+    
     ts = datetime.now().isoformat(timespec="seconds")
     print(f"[TOOL internet_search START {ts}] query={query!r}")
 
@@ -109,6 +111,7 @@ Rules:
 Final answers must cite URLs for factual claims.
 """
 
+
 critic_prompt = f"""\
 You are a critic agent.
 
@@ -119,12 +122,17 @@ Review:
 
 Decide sufficiency.
 
-Output exactly:
-- ENOUGH
-or
-- REVISE:
-  - <specific fix>
-  - <specific fix>
+Return EXACTLY one of the following two formats and nothing else:
+
+1) 
+    ENOUGH
+
+2) 
+    REVISE:
+    - <specific fix>
+    - <specific fix>
+    ... where <specific fix> details precise changes needed to improve the answer.
+
 """
 
 agent = create_deep_agent(
@@ -184,13 +192,36 @@ if __name__ == "__main__":
 
         revision_rounds += 1
 
+        
+        revision_prompt = f"""
+        You are revising an existing answer.
+
+        DO NOT rewrite the entire document.
+
+        ONLY apply the following changes:
+
+        {decision}
+
+        Rules:
+        - Preserve all unchanged text verbatim
+        - Modify only the specified sections
+        - If adding text, clearly mark it as [Added after critique]
+        - If you must remove content, replace it with a short marker: [Removed after critique] before and after the removed text
+        - Output the FULL updated answer (with only targeted edits applied).
+        """
+
         feedback = (
             decision
             + f"\nCritique rounds={critique_rounds}, Revision rounds={revision_rounds}."
         )
-
+        
         result = agent.invoke(
-            {"messages": [{"role": "user", "content": user_query + "\n\nCRITIC FEEDBACK:\n" + feedback}]},
+            {"messages": 
+                [
+                    {"role": "assistant", "content": current_text + "\n\nCRITIC FEEDBACK:\n" + feedback},
+                    {"role": "user", "content": revision_prompt},
+                ]
+            },
             config={"recursion_limit": 150, "callbacks": [logger]},
         )
 
