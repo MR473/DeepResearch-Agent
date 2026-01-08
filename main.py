@@ -2,7 +2,7 @@ import os
 import json
 import time
 from datetime import datetime
-from typing import Literal, Any, Dict
+from typing import Literal, Any, Dict, List
 
 from dotenv import load_dotenv
 from tavily import TavilyClient
@@ -16,11 +16,11 @@ load_dotenv()
 ARTIFACT_DIR = os.path.abspath("./artifacts")
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
-NOTES_PATH = "/artifacts/notes.md"
-OPEN_Q_PATH = "/artifacts/open_questions.md"
-OUTPUT_DISK_PATH = os.path.join(ARTIFACT_DIR, "output.txt")
-TOOL_LOG_PATH = os.path.join(ARTIFACT_DIR, "tool_log.jsonl")
-CRITIC_LOG_PATH = os.path.join(ARTIFACT_DIR, "critic_thoughts.txt")
+NOTES_PATH = "./artifacts/notes.md"
+OPEN_Q_PATH = "./artifacts/open_questions.md"
+OUTPUT_DISK_PATH = "./artifacts/output.txt"
+TOOL_LOG_PATH = "./artifacts/tool_log.jsonl"
+CRITIC_LOG_PATH = "./artifacts/critic_thoughts.txt"
 
 tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
@@ -33,7 +33,6 @@ def internet_search(
 ) -> Dict[str, Any]:
     
     """Search the internet using Tavily and return results with URLs/snippets."""
-    
     ts = datetime.now().isoformat(timespec="seconds")
     print(f"[TOOL internet_search START {ts}] query={query!r}")
 
@@ -86,53 +85,159 @@ def append_critic_thoughts(text: str, round_num: int):
         f.write(text.strip() + "\n")
 
 
+def write_output(text: str):
+    # output.txt is intended to be "current best answer" (overwrite is fine)
+    with open(OUTPUT_DISK_PATH, "w", encoding="utf-8") as f:
+        f.write(text.strip() + "\n")
+
+
+def warn_if_output_missing_sections(output_text: str) -> None:
+    """Optional guard: warns if required sections are missing in output.txt."""
+    required = ["Title:", "Overview:", "Main Discussion:", "Key Takeaways:", "Sources:"]
+    missing = [s for s in required if s not in output_text]
+    if missing:
+        print("\n⚠️ FORMAT WARNING: output.txt is missing required sections:")
+        for m in missing:
+            print(f"  - {m}")
+        print("The critic should request revision if this persists.\n")
+
+
 logger = ToolCallLogger()
 model = init_chat_model(model="gpt-5")
 backend = FilesystemBackend(root_dir=ARTIFACT_DIR, virtual_mode=True)
 
+
 system_prompt = f"""\
-You are a Deep Research Agent.
+You are a Deep Research Agent that produces clear, well-structured, and reader-friendly research outputs.
+
+Your primary goal is to explain findings in fluent, natural English that flows logically from one idea to the next.
 
 You must maintain append-only research history:
 - Notes: {NOTES_PATH}
 - Open questions: {OPEN_Q_PATH}
 
-Rules:
-- Never overwrite these files after creation.
-- Always read first, then append timestamped sections.
-- Corrections must be appended, not deleted.
-- Resolved questions must be marked with "Resolved:" lines.
-- Use internet_search for factual or time-sensitive info or any information you need.
-- At least one search required.
-- After critic feedback, additions must include [Added after critique].
-- At the end of notes, record:
-  Critique rounds: <N>, Revision rounds: <M>
+Hard rules (do not violate):
+- Never overwrite notes.md or open_questions.md after creation.
+- Always read existing content first, then append new, timestamped sections.
+- Corrections must be appended; never delete prior content.
+- When a question is resolved, clearly mark it with a line starting with: [Resolved]
+- Use internet_search for factual or time-sensitive information.
+- At least one internet_search call is required per user question.
+- Final factual claims must include source URLs.
 
-Final answers must cite URLs for factual claims.
+Writing quality rules (VERY IMPORTANT):
+- Write in complete paragraphs unless a list is clearly more readable.
+- Use smooth transitions between ideas (e.g., “However”, “As a result”, “In contrast”).
+- Prefer explanation and synthesis over listing raw facts.
+- Avoid robotic or tool-like phrasing.
+- Assume the reader is intelligent but unfamiliar with the topic.
+
+--------------------------------------------------
+ARTIFACT FORMAT CONTRACTS (MUST FOLLOW)
+--------------------------------------------------
+
+OUTPUT FILE: ./artifacts/output.txt
+This file is the final, human-readable answer.
+
+When you respond to the user, your returned message MUST follow EXACTLY this structure (in this order):
+
+Title:
+<One concise line>
+
+Overview:
+<One short paragraph explaining what this answer covers>
+
+Main Discussion:
+<Multiple paragraphs with smooth transitions and clear explanations>
+
+Key Takeaways:
+- <Bullet>
+- <Bullet>
+
+Sources:
+- <URL>
+- <URL>
+
+Do NOT include timestamps, critique notes, or tool logs in output.txt.
+
+--------------------------------------------------
+NOTES FILE: {NOTES_PATH}
+Append-only research notes.
+Each append MUST follow this structure:
+
+## Research Notes — <YYYY-MM-DD HH:MM>
+
+Context:
+<Why this research was done>
+
+Findings:
+<Paragraph-style explanation>
+
+Interpretation:
+<What these findings mean>
+
+Sources Consulted:
+- <URL>
+- <URL>
+
+At the end of notes.md, append a final line:
+Critique rounds: <N>, Revision rounds: <M>
+(These counts reset for each new user question.)
+
+--------------------------------------------------
+OPEN QUESTIONS FILE: {OPEN_Q_PATH}
+Append-only list of unresolved or resolved questions.
+Each entry MUST follow one of these formats:
+
+Unresolved:
+- Question: <text>
+  Why it matters: <text>
+
+Resolved:
+- [Resolved] <question>
+  Resolution summary: <1–2 lines>
+  Resolved on: <YYYY-MM-DD>
+
+--------------------------------------------------
+
+Self-check (silent, before finalizing):
+- Verify all required sections and headers are present and spelled exactly.
+- If verification fails, fix before returning the final response.
 """
 
 
 critic_prompt = f"""\
-You are a critic agent.
+You are a critic agent evaluating the clarity, completeness, and readability of the research output.
 
-Review:
+Review the following files:
 - {NOTES_PATH}
 - {OPEN_Q_PATH}
 - /artifacts/output.txt
 
-Decide sufficiency.
+Decide sufficiency AND format correctness.
+
+The output is ONLY acceptable if:
+- output.txt follows the required section structure EXACTLY:
+  Title:, Overview:, Main Discussion:, Key Takeaways:, Sources:
+- notes.md is append-only and each append follows the Research Notes structure
+- open_questions.md is append-only and follows the Open/Resolved formats
+- Writing is clear, fluent, and explanatory
 
 Return EXACTLY one of the following two formats and nothing else:
 
-1) 
-    ENOUGH
+1)
+ENOUGH
 
-2) 
-    REVISE:
-    - <specific fix>
-    - <specific fix>
-    ... where <specific fix> details precise changes needed to improve the answer.
+2)
+REVISE:
+- <specific change needed, referencing sections or paragraphs>
+- <specific clarity, structure, missing explanation, or synthesis improvement>
 
+Rules:
+- Be precise and actionable.
+- Focus on clarity, flow, missing explanations, weak synthesis, or formatting violations.
+- Do NOT suggest deleting timestamps or prior content from notes.md/open_questions.md.
+- Do NOT rewrite the document yourself.
 """
 
 agent = create_deep_agent(
@@ -148,90 +253,99 @@ critic = create_deep_agent(
     backend=backend,
 )
 
-
-def write_output(text: str):
-    with open(OUTPUT_DISK_PATH, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
 if __name__ == "__main__":
-    user_query = input("Your Question >>> ").strip()
-    if not user_query:
-        raise SystemExit("Please enter a question.")
+    print("Deep Research Agent started. Type \\exit to quit.\n")
 
-    MAX_REVISIONS = 3
-    critique_rounds = 0
-    revision_rounds = 0
+    while True:
+        user_query = input("Your Question >>> ").strip()
 
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": user_query}]},
-        config={"recursion_limit": 150, "callbacks": [logger]},
-    )
-
-    current_text = result["messages"][-1].content
-    print(current_text)
-    write_output(current_text)
-
-    while revision_rounds < MAX_REVISIONS:
-        critique_rounds += 1
-
-        critic_result = critic.invoke(
-            {"messages": [{"role": "user", "content": "Review artifacts now."}]},
-            config={"recursion_limit": 60, "callbacks": [logger]},
-        )
-
-        decision = critic_result["messages"][-1].content.strip()
-        append_critic_thoughts(decision, critique_rounds)
-        print("\nCRITIC DECISION:\n", decision)
-
-        if decision.upper().startswith("ENOUGH"):
+        if user_query.lower() == r"\exit":
+            print("Exiting. Goodbye!")
             break
 
-        if not decision.upper().startswith("REVISE"):
-            break
+        if not user_query:
+            print("Please enter a non-empty question.\n")
+            continue
 
-        revision_rounds += 1
+        MAX_REVISIONS = 3
+        critique_rounds = 0
+        revision_rounds = 0
 
-        
-        revision_prompt = f"""
-        You are revising an existing answer.
-
-        DO NOT rewrite the entire document.
-
-        ONLY apply the following changes:
-
-        {decision}
-
-        Rules:
-        - Preserve all unchanged text verbatim
-        - Modify only the specified sections
-        - If adding text, clearly mark it as [Added after critique]
-        - If you must remove content, replace it with a short marker: [Removed after critique] before and after the removed text
-        - Output the FULL updated answer (with only targeted edits applied).
-        """
-
-        feedback = (
-            decision
-            + f"\nCritique rounds={critique_rounds}, Revision rounds={revision_rounds}."
-        )
-        
         result = agent.invoke(
-            {"messages": 
-                [
-                    {"role": "assistant", "content": current_text + "\n\nCRITIC FEEDBACK:\n" + feedback},
-                    {"role": "user", "content": revision_prompt},
-                ]
-            },
+            {"messages": [{"role": "user", "content": user_query}]},
             config={"recursion_limit": 150, "callbacks": [logger]},
         )
 
         current_text = result["messages"][-1].content
-        print("\nREVISED OUTPUT:\n")
+        print("\nINITIAL OUTPUT:\n")
         print(current_text)
+        warn_if_output_missing_sections(current_text)
         write_output(current_text)
 
-    print(OUTPUT_DISK_PATH)
-    print(os.path.join(ARTIFACT_DIR, "notes.md"))
-    print(os.path.join(ARTIFACT_DIR, "open_questions.md"))
-    print(TOOL_LOG_PATH)
-    print(CRITIC_LOG_PATH)
+        while revision_rounds < MAX_REVISIONS:
+            critique_rounds += 1
+
+            critic_result = critic.invoke(
+                {"messages": [{"role": "user", "content": "Review artifacts now."}]},
+                config={"recursion_limit": 60, "callbacks": [logger]},
+            )
+
+            decision = critic_result["messages"][-1].content.strip()
+            append_critic_thoughts(decision, critique_rounds)
+
+            print("\nCRITIC DECISION:\n")
+            print(decision)
+
+            if decision.upper().startswith("ENOUGH"):
+                break
+
+            if not decision.upper().startswith("REVISE"):
+                print("Unexpected critic response. Stopping revisions.")
+                break
+
+            revision_rounds += 1
+
+            revision_prompt = f"""\
+                You are revising an existing answer to satisfy BOTH:
+                1) The critic's requested fixes, and
+                2) The artifact format contracts in the system prompt.
+
+                Apply ONLY the changes requested in the critic feedback below.
+
+                CRITIC FEEDBACK:
+                {decision}
+
+                Rules:
+                - Prefer minimal edits, but you MAY restructure sections if needed to meet required format.
+                - Ensure output.txt structure is EXACT: Title / Overview / Main Discussion / Key Takeaways / Sources.
+                - notes.md and open_questions.md must remain append-only: only append new timestamped sections or [Resolved] lines.
+                - If adding text, clearly mark it as [Added after critique] within notes.md/open_questions.md entries.
+                - If you must remove content inside output.txt, replace it with: [Removed after critique]
+                - Update the end of notes.md with:
+                Critique rounds: {critique_rounds}, Revision rounds: {revision_rounds}
+                Before finalizing, self-check that all required headers are present and spelled exactly.
+            """
+
+            result = agent.invoke(
+                {
+                    "messages": [
+                        {"role": "assistant", "content": current_text},
+                        {"role": "user", "content": revision_prompt},
+                    ]
+                },
+                config={"recursion_limit": 150, "callbacks": [logger]},
+            )
+
+            current_text = result["messages"][-1].content
+            print("\nREVISED OUTPUT:\n")
+            print(current_text)
+            warn_if_output_missing_sections(current_text)
+            write_output(current_text)
+
+        print("\nArtifacts written to:")
+        print(OUTPUT_DISK_PATH)
+        print(os.path.join(ARTIFACT_DIR, "notes.md"))
+        print(os.path.join(ARTIFACT_DIR, "open_questions.md"))
+        print(TOOL_LOG_PATH)
+        print(CRITIC_LOG_PATH)
+        print("\n--- Ready for next question ---\n")
